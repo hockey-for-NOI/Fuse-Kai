@@ -64,7 +64,7 @@ typedef	long long	ll;
 const	int	P = 0x78000001;
 const	int	R = 31;
 
-inline	int	powr2(int x, int base)
+int	powr2(int x, int base)
 {
 	ll s = (x & 1 ? base : 1), t = base;
 	while (x >>= 1)
@@ -74,15 +74,20 @@ inline	int	powr2(int x, int base)
 	}
 	return s;
 }
-inline  int powr(int x) {return powr2(x, R);}
+int powr(int x) {return powr2(x, R);}
 
 const   char    server_addr_str[] = "120.25.160.91";
 const   char    my_fuse_path[] = "/.myfuse/";
 const	unsigned	short	port0 = 12345;
 const	int	TIMEOUT_SEC = 5;
+const   int NUM_RETRY = 3;
+const   int BLK_NUM_BITS = 12;
+const   int BLK_SIZE = 1 << 12;
+const   int HTTP_PADDING = 1000;
+const   int HTTP_RECV_TOT = 1000 + (1 << 12);
 
-inline  void myseed(void) {srand48(time(0));}
-inline  int myrand(void) {return lrand48();}
+void myseed(void) {srand48(time(0));}
+int myrand(void) {return lrand48();}
 
 struct MyGlobalConnStorage
 {
@@ -95,6 +100,9 @@ struct MyGlobalConnStorage
 
 static int myread(int q0, int q1, char* buf, int size, int offset)
 {
+    printf("myread\n");
+    struct MyGlobalConnStorage *p = &global_conn_storage;
+
     json_object *obj, *idx;
     obj = json_object_new_object();
     idx = json_object_new_object();
@@ -102,16 +110,30 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
     json_object_object_add(idx, "q0", json_object_new_int(q0));
     json_object_object_add(idx, "q1", json_object_new_int(q1));
 
-    while (size)
+    for (int rest=size; rest; )
     {
-        int blkno = offset >> 12;
+        int blkno = offset >> BLK_NUM_BITS;
         json_object_object_add(idx, "blkno", json_object_new_int(blkno));
-        json_object_object_add(obj, "key", json_object_to_json_string(idx));
+        json_object_object_add(obj, "key", json_object_new_string(json_object_to_json_string(idx)));
 
         pthread_mutex_lock(&global_conn_storage.lock);
 
-        sprintf(sndbuf, "POST / HTTP/1.1\r\n%s", json_object_get_string(obj));
-        //TODO 
+        int len = sprintf(p->sndbuf, "POST / HTTP/1.1\r\n\r\n%s", json_object_to_json_string(obj));
+        int ret;
+        for (int i=0; i<NUM_RETRY; i++)
+        {
+            ret = write(p->connfd, p->sndbuf, len);
+            if (ret == len) break;
+        }
+        if (ret != len) exit(0);
+
+        for (int i=0; i<NUM_RETRY; i++)
+        {
+            ret = read(p->connfd, p->rcvbuf, HTTP_RECV_TOT);
+            if (ret > 0) break;
+        }
+        if (ret <= 0) exit(0);
+        printf("Recv: %s\n", p->rcvbuf);
 
         pthread_mutex_unlock(&global_conn_storage.lock);
 
@@ -121,6 +143,8 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
 
     json_object_put(obj);
     json_object_put(idx);
+
+    return size;
 }
 
 static int mywrite(int q0, int q1, char const* buf, int size, int offset)
@@ -162,6 +186,7 @@ static void *xmp_init(struct fuse_conn_info *conn,
 static void *pack_init(struct fuse_conn_info *conn,
 		      struct fuse_config *cfg)
 {
+    printf("init start\n");
 	mkdir(packpath(""), 0755);
 
     myseed();
@@ -183,8 +208,10 @@ static void *pack_init(struct fuse_conn_info *conn,
 
     global_conn_storage.serv_addr = serv_addr0;
     global_conn_storage.connfd = connfd0;
-    glboal_conn_storage.sndbuf = malloc(5000);
-    glboal_conn_storage.rcvbuf = malloc(5000);
+    global_conn_storage.sndbuf = malloc(HTTP_RECV_TOT+1);
+    global_conn_storage.rcvbuf = malloc(HTTP_RECV_TOT+1);
+
+    printf("init end\n");
 
     return xmp_init(conn, cfg);
 }
