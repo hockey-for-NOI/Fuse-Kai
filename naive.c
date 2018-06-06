@@ -56,53 +56,27 @@
 #include <stdlib.h>
 #include <time.h>
 
-#include <pthread.h>
 #include <json.h>
+#include <curl/curl.h>
 
-typedef	long long	ll;
-
-const	int	P = 0x78000001;
-const	int	R = 31;
-
-int	powr2(int x, int base)
-{
-	ll s = (x & 1 ? base : 1), t = base;
-	while (x >>= 1)
-	{
-		t = (t * t) % P;
-		if (x & 1) s = (s * t) % P;
-	}
-	return s;
-}
-int powr(int x) {return powr2(x, R);}
+const   char    my_fuse_path[] = "/.myfuse/";
 
 const   char    server_addr_str[] = "120.25.160.91";
-const   char    my_fuse_path[] = "/.myfuse/";
-const	unsigned	short	port0 = 12345;
-const	int	TIMEOUT_SEC = 5;
-const   int NUM_RETRY = 3;
+const   int server_port = 12345;
+const   int TIMEOUT_SEC = 5;
 const   int BLK_NUM_BITS = 12;
 const   int BLK_SIZE = 1 << 12;
-const   int HTTP_PADDING = 1000;
-const   int HTTP_RECV_TOT = 1000 + (1 << 12);
+const   int MAX_RECV_SIZE = 10000;
+const   int NUM_RETRY = 3;
 
-void myseed(void) {srand48(time(0));}
-int myrand(void) {return lrand48();}
-
-struct MyGlobalConnStorage
+static size_t curl_callback(char const* indata, size_t size, size_t num, char* outdata)
 {
-    struct sockaddr_in serv_addr;
-    int connfd;
-    pthread_mutex_t lock;
-    char *sndbuf, *rcvbuf;
-}   global_conn_storage;
-
+    memcpy(outdata, indata, size *= num);
+    return size;
+}
 
 static int myread(int q0, int q1, char* buf, int size, int offset)
 {
-    printf("myread\n");
-    struct MyGlobalConnStorage *p = &global_conn_storage;
-
     json_object *obj, *idx;
     obj = json_object_new_object();
     idx = json_object_new_object();
@@ -110,32 +84,55 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
     json_object_object_add(idx, "q0", json_object_new_int(q0));
     json_object_object_add(idx, "q1", json_object_new_int(q1));
 
+    char *recv_buf = malloc(MAX_RECV_SIZE);
+
+    CURL *curl = curl_easy_init();
+    curl_easy_setopt(curl, CURLOPT_URL, server_addr_str);
+    curl_easy_setopt(curl, CURLOPT_PORT, server_port);
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT_SEC);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, recv_buf);
+
+    int httpCode;
+
     for (int rest=size; rest; )
     {
         int blkno = offset >> BLK_NUM_BITS;
         json_object_object_add(idx, "blkno", json_object_new_int(blkno));
         json_object_object_add(obj, "key", json_object_new_string(json_object_to_json_string(idx)));
 
-        pthread_mutex_lock(&global_conn_storage.lock);
-
-        int len = sprintf(p->sndbuf, "POST / HTTP/1.1\r\n\r\n%s", json_object_to_json_string(obj));
-        int ret;
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_object_to_json_string(obj));
+        
+        httpCode = 0;
         for (int i=0; i<NUM_RETRY; i++)
         {
-            ret = write(p->connfd, p->sndbuf, len);
-            if (ret == len) break;
+            curl_easy_perform(curl);
+            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+            if (httpCode == 200) break;
         }
-        if (ret != len) exit(0);
+        if (httpCode != 200) exit(0);
 
-        for (int i=0; i<NUM_RETRY; i++)
-        {
-            ret = read(p->connfd, p->rcvbuf, HTTP_RECV_TOT);
-            if (ret > 0) break;
-        }
-        if (ret <= 0) exit(0);
-        printf("Recv: %s\n", p->rcvbuf);
+        json_object *ret = json_tokener_parse(recv_buf);
+        if (!ret) exit(0);
 
-        pthread_mutex_unlock(&global_conn_storage.lock);
+        json_object *status;
+        if (!json_object_object_get_ex(ret, "Status", &status)) exit(0);
+        assert(json_object_get_type(status) == json_type_int);
+        assert(json_object_get_int(status) == 1);
+
+        json_object *value;
+        if (!json_object_object_get_ex(ret, "Value", &value)) exit(0);
+        assert(json_object_get_type(value) == json_type_string);
+        char *dat = json_object_get_string(value);
+        //TODO: DECODE
+        int pad = offset & (BLK_SIZE - 1);
+        int len = BLK_SIZE - pad;
+        if (len > rest) len = rest;
+        memcpy(buf, dat + pad, len);
+        rest -= len; buf += len; offset += len;
+
+        json_object_put(ret);
 
         json_object_object_del(idx, "blkno");
         json_object_object_del(obj, "key");
@@ -144,11 +141,110 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
     json_object_put(obj);
     json_object_put(idx);
 
+    curl_easy_cleanup(curl);
+    free(recv_buf);
+
     return size;
 }
 
 static int mywrite(int q0, int q1, char const* buf, int size, int offset)
 {
+    json_object *obj, *idx;
+    robj = json_object_new_object();
+    wobj = json_object_new_object();
+    idx = json_object_new_object();
+    json_object_object_add(robj, "op", json_object_new_int(2));
+    json_object_object_add(wobj, "op", json_object_new_int(1));
+    json_object_object_add(idx, "q0", json_object_new_int(q0));
+    json_object_object_add(idx, "q1", json_object_new_int(q1));
+
+    char *recv_buf = malloc(MAX_RECV_SIZE);
+
+    CURL *curl = curl_easy_init();
+    curl_easy_setopt(curl, CURLOPT_URL, server_addr_str);
+    curl_easy_setopt(curl, CURLOPT_PORT, server_port);
+    curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT_SEC);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, recv_buf);
+
+    int httpCode;
+
+    for (int rest=size; rest; )
+    {
+        int blkno = offset >> BLK_NUM_BITS;
+        json_object_object_add(idx, "blkno", json_object_new_int(blkno));
+
+        if (offset & (BLK_SIZE - 1))
+        {
+            json_object_object_add(robj, "key", json_object_new_string(json_object_to_json_string(idx)));
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_object_to_json_string(robj));
+            httpCode = 0;
+            for (int i=0; i<NUM_RETRY; i++)
+            {
+                curl_easy_perform(curl);
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+                if (httpCode == 200) break;
+            }
+            if (httpCode != 200) exit(0);
+
+            json_object *ret = json_tokener_parse(recv_buf);
+            if (!ret) exit(0);
+
+            json_object *status;
+            if (!json_object_object_get_ex(ret, "Status", &status)) exit(0);
+            assert(json_object_get_type(status) == json_type_int);
+            assert(json_object_get_int(status) == 1);
+
+            json_object *value;
+            if (!json_object_object_get_ex(ret, "Value", &value)) exit(0);
+            assert(json_object_get_type(value) == json_type_string);
+            char *dat = json_object_get_string(value);
+            
+            //TODO: DECODE & CONCAT & ENCODE & WRITE
+
+            json_object_object_del(robj, "key");
+            json_object_put(ret);
+        }
+        else
+        {
+            json_object_object_add(wobj, "key", json_object_new_string(json_object_to_json_string(idx)));
+            //TODO: ADD ENCODED WRITE DATA TO WOBJ
+
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_object_to_json_string(wobj));
+            
+            httpCode = 0;
+            for (int i=0; i<NUM_RETRY; i++)
+            {
+                curl_easy_perform(curl);
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+                if (httpCode == 200) break;
+            }
+            if (httpCode != 200) exit(0);
+
+            json_object *ret = json_tokener_parse(recv_buf);
+            if (!ret) exit(0);
+
+            json_object *status;
+            if (!json_object_object_get_ex(ret, "Status", &status)) exit(0);
+            assert(json_object_get_type(status) == json_type_int);
+            assert(json_object_get_int(status) == 1);
+
+            json_object_put(ret);
+
+            json_object_object_del(wobj, "key");
+        }
+        json_object_object_del(idx, "blkno");
+    }
+
+    json_object_put(robj);
+    json_object_put(wobj);
+    json_object_put(idx);
+
+    curl_easy_cleanup(curl);
+    free(recv_buf);
+
+    return size;
 }
 
 static char* packpath(const char* path)
@@ -186,32 +282,9 @@ static void *xmp_init(struct fuse_conn_info *conn,
 static void *pack_init(struct fuse_conn_info *conn,
 		      struct fuse_config *cfg)
 {
-    printf("init start\n");
 	mkdir(packpath(""), 0755);
 
-    myseed();
-
-	struct sockaddr_in serv_addr0;
-
-	inet_pton(AF_INET, server_addr_str, &serv_addr0.sin_addr);
-
-	serv_addr0.sin_family = AF_INET;
-	serv_addr0.sin_port = htons(port0);
-
-    int connfd0 = socket(AF_INET, SOCK_STREAM, 0);
-
-	struct timeval tv;
-	tv.tv_sec = TIMEOUT_SEC;
-	tv.tv_usec = 0;
-	setsockopt(connfd0, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-	setsockopt(connfd0, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-
-    global_conn_storage.serv_addr = serv_addr0;
-    global_conn_storage.connfd = connfd0;
-    global_conn_storage.sndbuf = malloc(HTTP_RECV_TOT+1);
-    global_conn_storage.rcvbuf = malloc(HTTP_RECV_TOT+1);
-
-    printf("init end\n");
+    curl_global_init(CURL_GLOBAL_ALL);
 
     return xmp_init(conn, cfg);
 }
