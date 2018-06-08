@@ -53,11 +53,14 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
+#include <assert.h>
 #include <stdlib.h>
 #include <time.h>
 
 #include <json.h>
 #include <curl/curl.h>
+#include <glib.h>
+#include <glib/gi18n.h>
 
 const   char    my_fuse_path[] = "/.myfuse/";
 
@@ -69,9 +72,13 @@ const   int BLK_SIZE = 1 << 12;
 const   int MAX_RECV_SIZE = 10000;
 const   int NUM_RETRY = 3;
 
-static size_t curl_callback(char const* indata, size_t size, size_t num, char* outdata)
+static  inline  void myseed(void) {srand48(time(0));}
+static  inline  int myrand(void) {return lrand48();}
+
+static size_t curl_callback(char const* indata, size_t size, size_t num, char** outdata)
 {
-    memcpy(outdata, indata, size *= num);
+    memcpy(*outdata, indata, size *= num);
+    *outdata += size;
     return size;
 }
 
@@ -85,6 +92,7 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
     json_object_object_add(idx, "q1", json_object_new_int(q1));
 
     char *recv_buf = malloc(MAX_RECV_SIZE);
+    char *recv_ptr;
 
     CURL *curl = curl_easy_init();
     curl_easy_setopt(curl, CURLOPT_URL, server_addr_str);
@@ -92,9 +100,9 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT_SEC);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, recv_buf);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &recv_ptr);
 
-    int httpCode;
+    long httpCode; //???
 
     for (int rest=size; rest; )
     {
@@ -104,6 +112,7 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
 
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_object_to_json_string(obj));
         
+        recv_ptr = recv_buf;
         httpCode = 0;
         for (int i=0; i<NUM_RETRY; i++)
         {
@@ -124,13 +133,19 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
         json_object *value;
         if (!json_object_object_get_ex(ret, "Value", &value)) exit(0);
         assert(json_object_get_type(value) == json_type_string);
-        char *dat = json_object_get_string(value);
-        //TODO: DECODE
+        const char *dat = json_object_get_string(value);
+
+        gsize tmp;
+        gchar *decstr = g_base64_decode(dat, &tmp);
+        assert(tmp == BLK_SIZE);
+
         int pad = offset & (BLK_SIZE - 1);
         int len = BLK_SIZE - pad;
         if (len > rest) len = rest;
-        memcpy(buf, dat + pad, len);
+        memcpy(buf, decstr + pad, len);
         rest -= len; buf += len; offset += len;
+
+        g_free(decstr);
 
         json_object_put(ret);
 
@@ -149,7 +164,7 @@ static int myread(int q0, int q1, char* buf, int size, int offset)
 
 static int mywrite(int q0, int q1, char const* buf, int size, int offset)
 {
-    json_object *obj, *idx;
+    json_object *robj, *wobj, *idx;
     robj = json_object_new_object();
     wobj = json_object_new_object();
     idx = json_object_new_object();
@@ -159,6 +174,7 @@ static int mywrite(int q0, int q1, char const* buf, int size, int offset)
     json_object_object_add(idx, "q1", json_object_new_int(q1));
 
     char *recv_buf = malloc(MAX_RECV_SIZE);
+    char *recv_ptr;
 
     CURL *curl = curl_easy_init();
     curl_easy_setopt(curl, CURLOPT_URL, server_addr_str);
@@ -166,19 +182,22 @@ static int mywrite(int q0, int q1, char const* buf, int size, int offset)
     curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, TIMEOUT_SEC);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, recv_buf);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &recv_ptr);
 
-    int httpCode;
+    long httpCode; //???
 
     for (int rest=size; rest; )
     {
         int blkno = offset >> BLK_NUM_BITS;
         json_object_object_add(idx, "blkno", json_object_new_int(blkno));
 
+        int flag = 1;
         if (offset & (BLK_SIZE - 1))
         {
             json_object_object_add(robj, "key", json_object_new_string(json_object_to_json_string(idx)));
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_object_to_json_string(robj));
+            
+            recv_ptr = recv_buf;
             httpCode = 0;
             for (int i=0; i<NUM_RETRY; i++)
             {
@@ -194,25 +213,93 @@ static int mywrite(int q0, int q1, char const* buf, int size, int offset)
             json_object *status;
             if (!json_object_object_get_ex(ret, "Status", &status)) exit(0);
             assert(json_object_get_type(status) == json_type_int);
-            assert(json_object_get_int(status) == 1);
+            if (json_object_get_int(status) == 1)
+            {
+                flag = 0;
+                json_object *value;
+                if (!json_object_object_get_ex(ret, "Value", &value)) exit(0);
+                assert(json_object_get_type(value) == json_type_string);
+                const char *dat = json_object_get_string(value);
+                
+                gsize tmp;
+                gchar* decstr = g_base64_decode(dat, &tmp);
+                assert(tmp == BLK_SIZE);
+                
+                int pad = offset & (BLK_SIZE - 1);
+                int len = BLK_SIZE - pad;
+                if (len > rest) len = rest;
 
-            json_object *value;
-            if (!json_object_object_get_ex(ret, "Value", &value)) exit(0);
-            assert(json_object_get_type(value) == json_type_string);
-            char *dat = json_object_get_string(value);
-            
-            //TODO: DECODE & CONCAT & ENCODE & WRITE
+                memcpy(decstr + pad, buf, len);
+                rest -= len; buf += len; offset += len;
 
+                char *encstr = g_base64_encode(decstr, BLK_SIZE);
+                json_object_object_add(wobj, "value", json_object_new_string(encstr));
+                g_free(decstr);
+                g_free(encstr);
+
+                json_object_object_add(wobj, "key", json_object_new_string(json_object_to_json_string(idx)));
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_object_to_json_string(wobj));
+
+                recv_ptr = recv_buf;
+                httpCode = 0;
+                for (int i=0; i<NUM_RETRY; i++)
+                {
+                    curl_easy_perform(curl);
+                    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+                    if (httpCode == 200) break;
+                }
+                if (httpCode != 200) exit(0);
+
+                json_object *ret = json_tokener_parse(recv_buf);
+                if (!ret) exit(0);
+
+                json_object *status;
+                if (!json_object_object_get_ex(ret, "Status", &status)) exit(0);
+                assert(json_object_get_type(status) == json_type_int);
+                assert(json_object_get_int(status) == 1);
+
+                json_object_put(ret);
+
+                json_object_object_del(wobj, "key");
+                json_object* val;
+                json_object_object_get_ex(wobj, "value", &val);
+                json_object_object_del(wobj, "value");
+                json_object_put(val);
+            }
             json_object_object_del(robj, "key");
             json_object_put(ret);
         }
-        else
+        if (flag)
         {
             json_object_object_add(wobj, "key", json_object_new_string(json_object_to_json_string(idx)));
-            //TODO: ADD ENCODED WRITE DATA TO WOBJ
+            if ((!(offset & (BLK_SIZE - 1))) && rest >= BLK_SIZE)
+            {
+                rest -= BLK_SIZE; buf += BLK_SIZE; offset += BLK_SIZE;
+                char *encstr = g_base64_encode(buf, BLK_SIZE);
+                json_object_object_add(wobj, "value", json_object_new_string(encstr));
+                g_free(encstr);
+            }
+            else
+            {
+                char *pad_data = malloc(BLK_SIZE);
+
+                int pad = offset & (BLK_SIZE - 1);
+                int len = BLK_SIZE - pad;
+                if (len > rest) len = rest;
+
+                memcpy(pad_data + pad, buf, len);
+                rest -= len; buf += len; offset += len;
+
+                char *encstr = g_base64_encode(pad_data, BLK_SIZE);
+                json_object_object_add(wobj, "value", json_object_new_string(encstr));
+                g_free(encstr);
+
+                free(pad_data);
+            }
 
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_object_to_json_string(wobj));
             
+            recv_ptr = recv_buf;
             httpCode = 0;
             for (int i=0; i<NUM_RETRY; i++)
             {
@@ -233,6 +320,10 @@ static int mywrite(int q0, int q1, char const* buf, int size, int offset)
             json_object_put(ret);
 
             json_object_object_del(wobj, "key");
+            json_object* val;
+            json_object_object_get_ex(wobj, "value", &val);
+            json_object_object_del(wobj, "value");
+            json_object_put(val);
         }
         json_object_object_del(idx, "blkno");
     }
@@ -285,6 +376,8 @@ static void *pack_init(struct fuse_conn_info *conn,
 	mkdir(packpath(""), 0755);
 
     curl_global_init(CURL_GLOBAL_ALL);
+
+    myseed();
 
     return xmp_init(conn, cfg);
 }
