@@ -304,7 +304,7 @@ static void *xmp_init(struct fuse_conn_info *conn,
 static void *pack_init(struct fuse_conn_info *conn,
               struct fuse_config *cfg)
 {
-    mkdir(packpath(""), 0755);
+    mkdir(packpath(""), 00755);
 
     curl_global_init(CURL_GLOBAL_ALL);
 
@@ -325,7 +325,7 @@ static int modified_getattr(const char *path, struct stat *stbuf,
 
     if (S_ISREG(stbuf->st_mode))
     {
-        res = open(path, O_RDWR | O_CREAT, 0755);
+        res = open(path, O_RDWR | O_CREAT, 00755);
         if (res == -1)
             return -errno;
 
@@ -470,7 +470,7 @@ static int modified_create(const char *path, mode_t mode,
 {
     int res;
 
-    res = open(path, O_RDWR | O_CREAT | O_TRUNC, mode);
+    res = open(path, O_RDWR | O_CREAT | O_TRUNC, 0755);
     if (res == -1)
         return -errno;
 
