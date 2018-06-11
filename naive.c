@@ -96,7 +96,7 @@ static int myread_core(int q0, int q1, char* buf, int size, int offset)
     json_object_object_add(idx, "q0", json_object_new_int(q0));
     json_object_object_add(idx, "q1", json_object_new_int(q1));
 
-    char *recv_buf = malloc(MAX_RECV_SIZE);
+    char *recv_buf = g_malloc(MAX_RECV_SIZE);
     char *recv_ptr;
 
     CURL *curl = curl_easy_init();
@@ -158,7 +158,7 @@ cleanup1:
     json_object_put(obj);
 
     curl_easy_cleanup(curl);
-    free(recv_buf);
+    g_free(recv_buf);
 
     return retval;
 }
@@ -189,7 +189,7 @@ static int mywrite_core(int q0, int q1, char const* buf, int offset)
     json_object_object_add(idx, "q0", json_object_new_int(q0));
     json_object_object_add(idx, "q1", json_object_new_int(q1));
 
-    char *recv_buf = malloc(MAX_RECV_SIZE);
+    char *recv_buf = g_malloc(MAX_RECV_SIZE);
     char *recv_ptr;
 
     CURL *curl = curl_easy_init();
@@ -240,7 +240,7 @@ cleanup1:
     json_object_put(wobj);
 
     curl_easy_cleanup(curl);
-    free(recv_buf);
+    g_free(recv_buf);
 
     return retval;
 }
