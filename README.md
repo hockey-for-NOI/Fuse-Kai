@@ -50,4 +50,4 @@ The overall procedure is as follows:
 
 Multithreading disabled due to json-c library not supporting parallel creating, even on different objects.
 
-Parallel request disabled due to difficulties on curl callback functions with HTTP/TCP half-transferred packets. (UDP may completely bypass this issue, while the server doesn't support it >\_<).
+Parallel request disabled due to difficulties on curl callback functions with HTTP/TCP half-transferred packets. (UDP may completely bypass this issue, while the server currently doesn't support it).
